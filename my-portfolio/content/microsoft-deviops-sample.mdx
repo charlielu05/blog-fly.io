@@ -1,0 +1,87 @@
+---
+title: "'How Microsoft develops with DevOps': Sample implementation"
+publishedAt: "2025-05-01"
+summary: "Derivation of the normal equation via Optimization"
+tags: "Linear Algebra, Math"
+---
+
+This post will cover an actual implementation sample code for the development workflow covered in the article ["How Microsoft develops with DevOps"](https://learn.microsoft.com/en-us/devops/develop/how-microsoft-develops-devops#implementation-details).
+
+A little backstory about how this post came to be: the existing development/release workflow in Azure DevOps for our team came from a legacy code base where the workflow required multiple PR and merging to be done. Typically this would be: create a `feature/*` branch, PR and merge into `development`, PR and merge from `development` into `test` and then finally PR and merge from `test` into `main` for production deployment.
+
+We found this workflow to be quite cumbersome since it requires extra redundant work to raise another PR request when we want to promote our deployments.
+After a bit of research and comparison, we saw the post from Microsoft and how it was suitable for our particular needs (minimal PR/merges and versioned release). What was lacking though was an actual sample implementation on the post, thus the reason for this post. 
+
+### Azure DevOps Pipeline
+
+``` yaml
+name: demo pipeline
+
+pool:
+  name: 'Azure Pipelines'
+  vmImage: ubuntu-latest
+
+trigger:
+  - '*'
+
+stages:
+  - stage: build
+    dependsOn: []
+    # we dont want PR stage to run for main and release
+    condition: and(ne(variables['Build.SourceBranchName'], 'main'), not(startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+    jobs:
+    - template: templates/build-template.yaml
+    ...
+
+  - stage: dev
+    condition : eq(variables['Build.SourceBranchName'], 'main')
+    jobs:
+    - template: templates/infra-template.yaml 
+    ...
+
+  - stage: test
+    dependsOn: dev
+    condition: succeeded('dev')
+    jobs:
+    - template: templates/infra-template.yaml
+    ...
+
+  - stage: prod
+    dependsOn: [] # not dependent on any other stage
+    condition: startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')
+    jobs:
+    - template: templates/build-template.yaml
+    ...
+```
+
+
+Note the use of 
+```yaml
+trigger:
+    - '*'
+```
+This is due to the fact that Azure DevOps YAML pipeline does not support PR triggers when you use Azure Repos (which we do use). Therefore the work around is to trigger the pipeline every single time and use the `condition` field in the stage to decide if it should execute. 
+[link](https://learn.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/pr?view=azure-pipelines)
+
+### Pipeline runs
+**Single pipeline run for `feature/*`**
+<Image 
+ src="/microsoft-devops/pipeline.png"
+ alt="pipeline run image"
+ width={600}
+ height={500}
+/>
+
+*You can see from the images above that for a single run in the `feature/*` branch, only the build stage executes while the other ones are skipped.*
+<Image 
+ src="/microsoft-devops/pipelines.png"
+ alt="pipelines run image"
+ width={600}
+ height={500}
+/>
+
+Now, when a `feature/*` branch is created and pushed to the repo, it will automatically trigger the `build` stage. This is where you can run your linting checks, tests and display the infrastructure changes if it's an IaC repo.
+From there, a single PR into the `main` branch is all that is required for it to go into the `dev` and `test` environments.
+Once we are ready, we then create a `release/*` branch off `main` to deploy to `prod` environment.
+
+
