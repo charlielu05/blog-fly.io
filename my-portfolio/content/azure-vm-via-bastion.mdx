@@ -1,0 +1,368 @@
+---
+title: "VSCode via Azure Bastion and VM"
+publishedAt: "2025-05-28"
+summary: "Devops"
+tags: "Devops"
+---
+
+Often when we work on cloud infra, a virtual machine that allows us to test resources/services deployed in a private network is often invaluable.
+
+This will be my own documentation on how I managed to setup my development environment, running VSCode IDE on an Azure Virtual Machine using Azure Bastion.
+
+<Image 
+ src="/vscode-bastion/architecture-ssh.png"
+ alt="vscode remote ssh"
+ width={600}
+ height={500}
+/>
+One of the nice utility that VSCode supports is the ability to use SSH to remote into a virtual machine hosted in the cloud. This VM might provide better hardware specs for your work or you might
+need a VM that sits in the same network as your cloud deployed resources. 
+
+Often in the later scenario, the cloud infra/services would sit in a private subnet with no ingress access from the internet.
+The only way to access such VM is to either have a VPN so you're also connected into the network via the VPN or sometimes they would have a jump-box/bastion VM that sits in the same network but
+in a different subnet and has internet ingress access/public IP address to connect to so the user can first connect to the jump-box/bastion then to the actual VM sitting in the private subnet.
+
+## Option 1: VPN
+<Image 
+ src="/vscode-bastion/option_1.png"
+ alt="option 1"
+ width={300}
+ height={400}
+/>
+
+## Option 2: Bastion/Jumpbox
+<Image 
+ src="/vscode-bastion/option_2.png"
+ alt="option 2"
+ width={300}
+ height={400}
+/>
+
+Setting up these various services (VPN, jump-box) involves a bit of yak shaving, small tasks which are really distractions to what you're trying to achieve: getting productive on your VM.
+
+Fortunatley, Azure provides a service to provision a [Bastion](https://learn.microsoft.com/en-us/azure/bastion/bastion-overview) for you and allows you to simply connect via the Azure CLI.
+This is great for two reasons: first, you're not required to manage your own VM. Second because this allows you to connect via HTTPS via the Azure CLI to the bastion which then routes to the VM
+via RDP or SSH, this means you don't have to have an open SSH port exposed to the internet on a normal bastion machine. Authentication is handled by Azure AD to the bastion and then an option
+of password or public/private keypair on the VM. 
+
+Less yak shaving all around.
+
+## Setup
+We're going to use Terraform for IaC, here's what we will deploy as a minimum working example:
+- Virtual Network with two subnet, one for the VM and one for the bastion.
+- Public IP for the bastion.
+- Security groups for VM and Bastion subnets.
+- Azure Bastion
+- Azure Virtual Machine.
+
+Before we start, create a SSH private/public key pair if you don't have one and put the public key (with the `.pub` extension) in a sub-folder called `ssh_pub` inside the `terraform` folder.
+```
+├── terraform
+│   ├── ssh_pub
+│   │   ├── public_key.pub
+│   ├── main.yaml
+│   ├── network.yaml
+│   ├── compute.yaml
+```
+
+In the `main.yaml` we will define our providers in terraform.
+```
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "=4.28.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  resource_provider_registrations = "none"
+  subscription_id                 = <your azure sub id>
+  features {}
+}
+```
+
+`network.yaml` is where we will create the virtual network, subents and the various network security groups. 
+
+```
+resource "azurerm_network_security_group" "compute" {
+  name                = "compute"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+}
+
+resource "azurerm_virtual_network" "demo" {
+  name                = "demo"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+  address_space       = ["10.0.0.0/16"]
+
+  subnet {
+    name             = "Compute"
+    address_prefixes = ["10.0.1.0/24"]
+    security_group   = azurerm_network_security_group.compute.id
+  }
+
+  subnet {
+    name             = "AzureBastionSubnet"
+    address_prefixes = ["10.0.0.224/27"]
+    security_group   = azurerm_network_security_group.bastion.id
+  }
+}
+
+resource "azurerm_public_ip" "demo_compute" {
+  name                = "bastion_public_ip"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+# https://learn.microsoft.com/en-us/azure/bastion/bastion-nsg
+resource "azurerm_network_security_group" "bastion" {
+  name                = "bastion-nsg"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+
+  security_rule {
+    name                       = "AllowHttpsInbound"
+    priority                   = 120
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "AllowGatewayManagerInbound"
+    priority                   = 130
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "GatewayManager"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "AllowAzureLoadBalancerInbound"
+    priority                   = 140
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "AzureLoadBalancer"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "AllowBastionHostCommunication"
+    priority                   = 150
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_ranges    = ["8080", "5701"]
+    source_address_prefix      = "VirtualNetwork"
+    destination_address_prefix = "VirtualNetwork"
+  }
+
+  security_rule {
+    name                       = "AllowSshRdpOutbound"
+    priority                   = 100
+    direction                  = "Outbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_ranges    = ["22", "3389"]
+    source_address_prefix      = "*"
+    destination_address_prefix = "VirtualNetwork"
+  }
+
+  security_rule {
+    name                       = "AllowAzureCloudOutbound"
+    priority                   = 110
+    direction                  = "Outbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "*"
+    destination_address_prefix = "AzureCloud"
+  }
+
+  security_rule {
+    name                       = "AllowBastionCommunication"
+    priority                   = 120
+    direction                  = "Outbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_ranges    = ["8080", "5701"]
+    source_address_prefix      = "VirtualNetwork"
+    destination_address_prefix = "VirtualNetwork"
+  }
+
+  security_rule {
+    name                       = "AllowHttpOutbound"
+    priority                   = 130
+    direction                  = "Outbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "Internet"
+  }
+}
+
+```
+
+`compute.yaml`: this is where we add our virtual machine and bastion. An important thing to point out is that if you want to be able to tunnel to your VM using VSCode the SKU for the bastion must be `Standard` or above.
+```
+locals {
+  bastion_subnet_id = [for subnet in tolist(azurerm_virtual_network.demo.subnet) : subnet.id if subnet.name == "AzureBastionSubnet"][0]
+}
+
+locals {
+  compute_subnet_id = [for subnet in tolist(azurerm_virtual_network.demo.subnet) : subnet.id if subnet.name == "Compute"][0]
+}
+
+resource "azurerm_bastion_host" "demo_bastion" {
+  name                = "demo_bastion"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+  sku                 = "Standard"
+  tunneling_enabled   = true
+
+  ip_configuration {
+    name                 = "configuration"
+    subnet_id            = local.bastion_subnet_id
+    public_ip_address_id = azurerm_public_ip.demo_compute.id
+  }
+}
+
+resource "azurerm_network_security_group" "nsg" {
+  name                = "nsg-network-interface"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+}
+
+resource "azurerm_network_interface_security_group_association" "nsgnic" {
+  network_interface_id      = azurerm_network_interface.nic.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
+}
+
+resource "azurerm_network_interface" "nic" {
+  name                = "nic-vm"
+  location            = data.azurerm_resource_group.demo.location
+  resource_group_name = data.azurerm_resource_group.demo.name
+
+  ip_configuration {
+    name                          = "nic-configuration"
+    subnet_id                     = local.compute_subnet_id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "dev" {
+  name                            = "dev-machine"
+  resource_group_name             = data.azurerm_resource_group.demo.name
+  location                        = data.azurerm_resource_group.demo.location
+  size                            = "Standard_B2ms"
+  admin_username                  = "adminuser"
+  disable_password_authentication = true
+  network_interface_ids = [
+    azurerm_network_interface.nic.id,
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
+  }
+
+  admin_ssh_key {
+    username   = "adminuser"
+    public_key = file("./ssh_pub/public_key.pub")
+  }
+}
+```
+Now run `terraform init`/`terraform apply` and wait for the deployment to complete.
+
+## Connecting from VSCode
+These following extensions should be installed on your VSCode IDE: `Remote-SSH` and `Remote Explorer`.
+### 1. Auth to Azure
+```
+az login
+```
+
+### 2. Setup the environment variables
+Inside a VSCode terminal running Linux we want to set the following environment variables:
+```
+export bastion_name="demo_bastion"
+export rg="resource group id"
+export vm_id="virtual machine id"
+export username="adminuser"
+```
+
+### 3. Connect to the VM
+Now we want to connect to the VM via the bastion and forward the port of the VM to your localhost for the next step. 
+
+Credit goes to Kris Zentner's post [here](https://feedback.azure.com/d365community/idea/e55b67ca-3b39-ed11-a81b-000d3a04ded5)
+which in turn I found from this open Github issue thread [here](https://github.com/microsoft/vscode-remote-release/issues/7179)
+```
+az network bastion tunnel -n $bastion_name -g $rg \
+   --target-resource-id $vm_id --resource-port 22 --port 22
+```
+
+### 4. Setup SSH config file
+Bring up your SSH config file, I do this from the remote explorer extension then choosing Remotes (Tunnels/SSH) and then the cog wheel icon to bring up my config file in my Users directory.
+<Image 
+ src="/vscode-bastion/ssh_config.png"
+ alt="ssh configuration"
+ width={700}
+ height={800}
+/>
+Once you've brought up the config file, add the following entry:
+
+```
+Host tunneltunnel
+  HostName 127.0.0.1
+  User adminuser
+  StrictHostKeyChecking=No
+  UserKnownHostsFile=\\.\NUL
+  Port 2222
+```
+
+### 5. Connet from VSCode
+In a separate terminal, run this command to create a ssh tunnel from the bastion tunnel.
+```
+ssh -L 2222:127.0.0.1:22 adminuser@127.0.0.1
+```
+Now in the remote explorer extension, under Remotes (Tunnels/SSH) choose the `tunneltunnel` host and click on either `connect in this window` or `connect in new window`.
+You should now be connected to your VM using VS Code if all goes well!
+
+### 6. *Optional* If you get a connection denied error
+Depending on certain images used on the VM, the `AllowTcpForwarding` parameter in the `/etc/ssh/sshd_config` file on the VM might need to be set to `yes`.
+To do this, instead of using `az network bastion tunnel` we can use the ssh command to directly connect to the VM in the terminal and set the `/etc/ssh/sshd_config` file via the SSH terminal.
+```
+az network bastion ssh --name $bastion_name --resource-group $rg --target-resource-id $vm_id --username "adminuser" --auth-type ssh-key --ssh-key ~/.ssh/id_ed25519
+```
+
+---
+
+Hope this post was helpful to you. I wanted to put a blog post together for this topic as I was getting frustrated when I set out to achieve this given since all the information were spread out in different
+places and required quite a bit of Google-fu and LLM asking before I could get things working.
